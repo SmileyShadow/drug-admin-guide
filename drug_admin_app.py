@@ -2,101 +2,130 @@
 
 import streamlit as st
 import requests
+from urllib.parse import quote_plus
 
-# Title
-st.title("Drug Administration Guide")
+# --- Configuration ---
+FDA_LABEL_URL = "https://api.fda.gov/drug/label.json"
 
-# Input field with dynamic suggestions via OpenFDA
-query = st.text_input("Enter drug name (e.g., Metformin)")
-
-suggestions = []
-if query and query.strip():
-    q = query.strip().lower()
+# --- Caching ---
+@st.cache_data(show_spinner=False)
+def fetch_suggestions(query: str):
+    """
+    Fetch up to 10 brand or generic name suggestions matching the query.
+    Uses proper OpenFDA search syntax with OR and URL encoding.
+    """
+    q = query.strip()
+    if not q:
+        return []
+    # Build OpenFDA search expression
+    expr = f'(openfda.brand_name:"{q}" OR openfda.generic_name:"{q}")'
+    params = {"search": expr, "limit": 10}
     try:
-        resp = requests.get(
-            "https://api.fda.gov/drug/label.json",
-            params={
-                "search": f"openfda.brand_name:{q}* OR openfda.generic_name:{q}*",  
-                "limit": 10
-            }
-        )
+        resp = requests.get(FDA_LABEL_URL, params=params, timeout=5)
+        resp.raise_for_status()
         data = resp.json()
         api_names = []
         for r in data.get("results", []):
-            api = r.get("openfda", {})
-            api_names += api.get("brand_name", [])
-            api_names += api.get("generic_name", [])
-        # Deduplicate
-        suggestions = list(dict.fromkeys(api_names))
-    except:
-        suggestions = []
+            of = r.get("openfda", {})
+            api_names += of.get("brand_name", [])
+            api_names += of.get("generic_name", [])
+        # Deduplicate and return
+        return list(dict.fromkeys(api_names))
+    except Exception:
+        return []
 
-# Show suggestions dropdown
+@st.cache_data(show_spinner=False)
+def fetch_instructions(query: str):
+    """
+    Fetch the first matching drug label entry and extract key fields.
+    Returns a dict with lists: indications, dosage, interactions, precautions.
+    """
+    q = query.strip()
+    if not q:
+        return None
+    expr = f'(openfda.brand_name:"{q}" OR openfda.generic_name:"{q}")'
+    params = {"search": expr, "limit": 1}
+    resp = requests.get(FDA_LABEL_URL, params=params, timeout=5)
+    if resp.status_code != 200:
+        return None
+    data = resp.json()
+    results = data.get("results", [])
+    if not results:
+        return None
+    r = results[0]
+    return {
+        "indications": r.get("indications_and_usage", []),
+        "dosage": r.get("dosage_and_administration", []),
+        "interactions": r.get("drug_interactions", []),
+        "precautions": r.get("precautions_and_warnings", [])
+    }
+
+# --- UI ---
+st.set_page_config(page_title="Drug Administration Guide", layout="centered")
+st.title("💊 Drug Administration Guide")
+
+# Input & Suggestions
+query = st.text_input("Enter drug name", value="")
+suggestions = fetch_suggestions(query)
 if suggestions:
-    choice = st.selectbox("Suggestions (choose or type)", [""] + suggestions)
+    choice = st.selectbox("Suggestions (choose or continue typing)", [""] + suggestions)
     if choice:
         query = choice
 
-# Fetch and display instructions
+# Fetch button
 if st.button("Get Instructions"):
-    if not query or not query.strip():
+    if not query.strip():
         st.warning("Please enter or select a drug name.")
     else:
-        with st.spinner("Fetching data..."):
-            try:
-                resp = requests.get(
-                    "https://api.fda.gov/drug/label.json",
-                    params={
-                        "search": f"openfda.brand_name:{query} OR openfda.generic_name:{query}",
-                        "limit": 1
-                    }
-                )
-                data = resp.json()
-                results = data.get("results", [])
-                if not results:
-                    st.error("No instructions found for this medication.")
-                else:
-                    r = results[0]
-                    dosage = r.get("dosage_and_administration", [])
-                    indications = r.get("indications_and_usage", [])
-                    interactions = r.get("drug_interactions", [])
-                    precautions = r.get("precautions_and_warnings", [])
+        with st.spinner("Fetching information..."):
+            info = fetch_instructions(query)
+        if info is None:
+            st.error("No trusted information found. Please verify drug name or try another.")
+        else:
+            # Key summary
+            st.header("Key Patient Instructions 📋")
+            main_ind = info["indications"][0] if info["indications"] else "Not available."
+            admin = info["dosage"][0] if info["dosage"] else "Not available."
+            important = (
+                info["interactions"][0] or info["precautions"][0]
+                if info["interactions"] or info["precautions"]
+                else "None noted."
+            )
+            st.markdown(f"**Main Indication:** {main_ind}")
+            st.markdown(f"**Administration:** {admin}")
+            st.markdown(f"**Important Instructions:** {important}")
 
-                    # Key summary
-                    st.header("Key Patient Instructions")
-                    st.markdown(f"**Main Indication:** {indications[0] if indications else 'Not available.'}")
-                    st.markdown(f"**Administration:** {dosage[0] if dosage else 'Not available.'}")
-                    important = interactions[0] if interactions else (precautions[0] if precautions else 'None noted.')
-                    st.markdown(f"**Important Instructions:** {important}")
+            # Detailed sections
+            st.subheader("Indications & Usage")
+            if info["indications"]:
+                for i in info["indications"]:
+                    st.write(f"- {i}")
+            else:
+                st.write("No data.")
 
-                    # Detailed sections
-                    st.subheader("Indications & Usage")
-                    if indications:
-                        for item in indications:
-                            st.write("-", item)
-                    else:
-                        st.write("No data.")
+            st.subheader("Dosage & Administration")
+            if info["dosage"]:
+                for d in info["dosage"]:
+                    st.write(f"- {d}")
+            else:
+                st.write("No data.")
 
-                    st.subheader("Dosage & Administration")
-                    if dosage:
-                        for item in dosage:
-                            st.write("-", item)
-                    else:
-                        st.write("No data.")
+            if info["interactions"] or info["precautions"]:
+                st.subheader("Interactions & Precautions")
+                if info["interactions"]:
+                    st.write("**Interactions:**")
+                    for x in info["interactions"]:
+                        st.write(f"- {x}")
+                if info["precautions"]:
+                    st.write("**Precautions:**")
+                    for p in info["precautions"]:
+                        st.write(f"- {p}")
 
-                    if interactions or precautions:
-                        st.subheader("Interactions & Precautions")
-                        if interactions:
-                            st.write("**Interactions:**")
-                            for item in interactions:
-                                st.write("-", item)
-                        if precautions:
-                            st.write("**Precautions:**")
-                            for item in precautions:
-                                st.write("-", item)
-            except Exception as e:
-                st.error(f"Error fetching data: {e}")
+            # Disclaimer
+            st.caption(
+                "Data from FDA open API; please verify with official prescribing information before clinical use."
+            )
 
-# Running instructions:
-# pip install streamlit requests
-# streamlit run drug_admin_app.py
+# --- Instructions ---
+# 1. pip install streamlit requests
+# 2. streamlit run drug_admin_app.py
